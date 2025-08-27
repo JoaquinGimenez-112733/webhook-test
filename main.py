@@ -1,7 +1,7 @@
 import os
 import json
 import textwrap
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from fastapi import FastAPI, Request, Response, BackgroundTasks
 import httpx
@@ -16,48 +16,57 @@ app = FastAPI(title="HacknPlan → Discord bridge")
 
 # ====== Diccionarios para humanizar el evento ======
 EMOJI = {"created": "➕", "updated": "✏️", "deleted": "🗑️"}
-NOUN_MAP_ES = {
-    "designelement": "Elemento de diseño",
-    "workitem": "Tarea",
-}
-NOUN_MAP_EN = {
-    "designelement": "Design element",
-    "workitem": "Work item",
+NOUN_MAP_ES = {"designelement": "Elemento de diseño", "workitem": "Tarea"}
+NOUN_MAP_EN = {"designelement": "Design element", "workitem": "Work item"}
+
+# Sinónimos/variantes de acción que podrían venir desde HNP
+ACTION_SYNONYMS = {
+    "created": {"created", "create", "added", "add", "new"},
+    "updated": {"updated", "update", "changed", "change", "modified", "modify", "edit", "edited"},
+    "deleted": {"deleted", "delete", "removed", "remove", "archived", "archive"},
 }
 
-def format_event(event_type: str, type_name: str | None, locale: str = "es", element_name: str | None = None) -> str:
+def normalize_action(action_raw: str) -> str:
+    a = (action_raw or "").lower()
+    for canonical, variants in ACTION_SYNONYMS.items():
+        if a in variants:
+            return canonical
+    return a or ""
+
+def split_and_normalize_event(event_type: str) -> Tuple[str, str]:
+    """Devuelve (kind_lower, action_canonical) a partir de 'DesignElement.Deleted', 'WorkItem.Removed', etc."""
     et = (event_type or "").strip()
     if "." in et:
         kind, action = et.split(".", 1)
     else:
         kind, action = et, ""
-    kind_l = kind.lower()
-    action_l = action.lower()
+    return (kind.lower(), normalize_action(action))
 
+def format_event(event_type: str, type_name: str | None, locale: str = "es", element_name: str | None = None) -> str:
+    kind_l, action_norm = split_and_normalize_event(event_type)
     noun_map = NOUN_MAP_ES if locale == "es" else NOUN_MAP_EN
     base_noun = noun_map.get(kind_l, ("Evento" if locale == "es" else "Event"))
     noun = type_name or base_noun
-
-    emoji = EMOJI.get(action_l, "🔔")
+    emoji = EMOJI.get(action_norm, "🔔")
 
     if locale == "es":
-        if action_l == "created":
+        if action_norm == "created":
             label = f"Nuevo {noun}"
-        elif action_l == "deleted":
+        elif action_norm == "deleted":
             label = f"{noun} eliminado"
-        elif action_l == "updated":
+        elif action_norm == "updated":
             label = f"{noun} actualizado"
         else:
-            label = f"{noun} ({et or 'Evento'})"
+            label = f"{noun} ({event_type or 'Evento'})"
     else:
-        if action_l == "created":
+        if action_norm == "created":
             label = f"New {noun}"
-        elif action_l == "deleted":
+        elif action_norm == "deleted":
             label = f"{noun} deleted"
-        elif action_l == "updated":
+        elif action_norm == "updated":
             label = f"{noun} updated"
         else:
-            label = f"{noun} ({et or 'Event'})"
+            label = f"{noun} ({event_type or 'Event'})"
 
     if element_name:
         label = f"{label}: {element_name}"
@@ -113,7 +122,7 @@ def extract_fields(payload: dict):
     desc = (
         get_in(payload, ["data", "summary"])
         or get_in(payload, ["data", "description"])
-        or payload.get("Description")  # <- en tu payload venía vacío
+        or payload.get("Description")
         or payload.get("Summary")
         or payload.get("description")
         or payload.get("summary")
@@ -143,9 +152,14 @@ def extract_fields(payload: dict):
 async def post_to_discord(event_type: str, payload: Dict[str, Any], raw_excerpt: str):
     title, desc, url, type_name, de_id, proj_id, parent_name = extract_fields(payload)
 
-    # Fallback si la descripción viene vacía
+    # Fallback de descripción
     if not (isinstance(desc, str) and desc.strip()):
         desc = "Sin descripción."
+
+    # Si es un borrado, no enlazamos URL (suele 404)
+    _, action_norm = split_and_normalize_event(event_type)
+    if action_norm == "deleted":
+        url = None
 
     embed = {
         "title": title or "Elemento de diseño",
@@ -163,10 +177,7 @@ async def post_to_discord(event_type: str, payload: Dict[str, Any], raw_excerpt:
 
     content = format_event(event_type, type_name, NOTIF_LOCALE, element_name=title)
 
-    body = {
-        "content": content,
-        "embeds": [embed],
-    }
+    body = {"content": content, "embeds": [embed]}
 
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(DISCORD_WEBHOOK_URL, json=body)
@@ -210,7 +221,7 @@ async def parse_request(req: Request) -> Dict[str, Any]:
 
 
 # ====== Endpoints ======
-@app.post("/hacknplan")
+@app.api_route("/hacknplan", methods=["POST", "DELETE"])
 async def hacknplan(req: Request, bg: BackgroundTasks):
     # Auth simple por query param: /hacknplan?token=XXXXX
     if TOKEN and req.query_params.get("token") != TOKEN:
@@ -221,7 +232,7 @@ async def hacknplan(req: Request, bg: BackgroundTasks):
     payload = await parse_request(req)
     event_type = event_type or payload.get("event") or payload.get("type") or "Unknown"
 
-    # Resumen crudo del payload (solo por si querés debug; ya no lo mostramos en Discord)
+    # Resumen crudo del payload (para logs)
     try:
         raw_excerpt = shorten(
             textwrap.indent(json.dumps(payload, ensure_ascii=False, indent=2), "  "),
@@ -230,7 +241,8 @@ async def hacknplan(req: Request, bg: BackgroundTasks):
     except Exception:
         raw_excerpt = "—"
 
-    # Logs en Render (Panel → Logs)
+    # Logs en Render
+    print("HNP method:", req.method)
     print("HNP event:", event_type)
     print("Payload keys:", list(payload.keys())[:20])
 
