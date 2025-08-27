@@ -1,6 +1,6 @@
 import os
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fastapi import FastAPI, Request, Response, BackgroundTasks
 import httpx
@@ -21,8 +21,15 @@ NOUN_EN = {"designelement": "Design element", "workitem": "Work item"}
 ACTION_SYNONYMS = {
     "created": {"created", "create", "added", "add", "new"},
     "updated": {"updated", "update", "changed", "change", "modified", "modify", "edit", "edited"},
-    # Incluimos "archived" como borrado lógico
     "deleted": {"deleted", "delete", "removed", "remove", "archived", "archive"},
+}
+
+# Mapeo de StageId de WorkItem -> (etiqueta, emoji)
+WORK_STAGE_MAP = {
+    1: ("Planificada", "📝"),
+    2: ("En progreso", "⏳"),
+    3: ("Testeandose", "🧪"),
+    4: ("Completada", "✅"),
 }
 
 def normalize_action(raw: str) -> str:
@@ -71,10 +78,12 @@ def format_content(event_type: str, type_name: Optional[str], element_name: Opti
     return f"{emoji} **{label}**"
 
 # ================== Utils ==================
-def get_in(d: Dict[str, Any], path: List[str]):
-    cur = d
+def get_in(d: Union[Dict[str, Any], List[Any]], path: List[Union[str, int]]):
+    cur: Any = d
     for k in path:
-        if isinstance(cur, dict) and k in cur:
+        if isinstance(cur, dict) and isinstance(k, str) and k in cur:
+            cur = cur[k]
+        elif isinstance(cur, list) and isinstance(k, int) and 0 <= k < len(cur):
             cur = cur[k]
         else:
             return None
@@ -99,89 +108,153 @@ def compute_url(payload: dict) -> Optional[str]:
         return None
 
 # ================== Extractores ==================
-# Ajustado a tu payload real: User.User.Name / User.User.Username
-ACTOR_PATHS: List[List[str]] = [
+# Actor: ajustado a DesignElement y WorkItem (tu payload real incluye User.User.* en Design; en WorkItem puede venir User.Name vacío, así que probamos AssignedUsers[0])
+ACTOR_PATHS: List[List[Union[str, int]]] = [
     ["User", "User", "Name"],
     ["User", "User", "Username"],
     ["User", "Name"],
+    ["User", "Username"],
     ["UpdatedBy", "Name"],
     ["ChangedBy", "Name"],
     ["Author", "Name"],
-    ["UserName"],
-    ["Username"],
+    ["AssignedUsers", 0, "User", "Name"],
+    ["AssignedUsers", 0, "User", "Username"],
 ]
 
 def extract_actor(p: dict) -> Optional[str]:
     for path in ACTOR_PATHS:
-        val = get_in(p, path) if len(path) > 1 else p.get(path[0])
+        val = get_in(p, path)
         if isinstance(val, str) and val.strip():
             return val.strip()
     return None
 
+def extract_stage_info(p: dict) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    """
+    Devuelve (stage_id, stage_label, stage_emoji) para WorkItem.
+    """
+    sid = get_in(p, ["Stage", "StageId"])
+    if isinstance(sid, int) and sid in WORK_STAGE_MAP:
+        label, emoji = WORK_STAGE_MAP[sid]
+        return sid, label, emoji
+    return None, None, None
+
 def extract_fields(p: dict):
-    """Adaptado a payload PascalCase típico de HNP + fallback data.* si existiera."""
+    """Campos comunes y específicos (DesignElement/WorkItem)."""
+    # título
     title = pick_str(
         get_in(p, ["data", "title"]),
         get_in(p, ["data", "name"]),
-        p.get("Name"), p.get("Title"), p.get("name"), p.get("title"),
+        p.get("Title"), p.get("Name"),
+        p.get("title"), p.get("name"),
     )
 
+    # descripción
     desc = pick_str(
         get_in(p, ["data", "summary"]),
         get_in(p, ["data", "description"]),
-        p.get("Description"), p.get("Summary"), p.get("description"), p.get("summary"),
+        p.get("Description"), p.get("Summary"),
+        p.get("description"), p.get("summary"),
     ) or ("Sin descripción." if NOTIF_LOCALE == "es" else "No description.")
 
+    # tipo (solo DesignElement suele traer Type.Name)
     type_name = pick_str(
         get_in(p, ["Type", "Name"]),
         get_in(p, ["data", "type", "name"]),
         p.get("TypeName"),
     )
 
+    # ids
     project_id = p.get("ProjectId") or get_in(p, ["data", "projectId"])
     design_element_id = p.get("DesignElementId") or get_in(p, ["data", "id"])
+    work_item_id = p.get("WorkItemId")
 
+    # url (solo aplicará a DesignElement si tienes HNP_URL_TEMPLATE configurada a ese recurso)
     url = pick_str(
         get_in(p, ["data", "url"]),
         get_in(p, ["data", "webUrl"]),
         p.get("Url"), p.get("url"),
     ) or compute_url(p)
 
+    # parent para design elements
     parent_name = get_in(p, ["Parent", "Name"])
 
-    # Flag para tratar "archivado" como borrado lógico (sin link)
+    # stage para work items
+    stage_id, stage_label, stage_emoji = extract_stage_info(p)
+
+    # archivado (para tratar como delete lógico)
     archived = str(p.get("Archived", "")).lower() in ("true", "1", "yes") or \
                str(p.get("IsArchived", "")).lower() in ("true", "1", "yes")
 
-    return title, desc, url, type_name, project_id, design_element_id, parent_name, archived
+    return {
+        "title": title,
+        "desc": desc,
+        "type_name": type_name,
+        "project_id": project_id,
+        "design_element_id": design_element_id,
+        "work_item_id": work_item_id,
+        "url": url,
+        "parent_name": parent_name,
+        "stage_id": stage_id,
+        "stage_label": stage_label,
+        "stage_emoji": stage_emoji,
+        "archived": archived,
+    }
 
 # ================== Discord ==================
 async def post_to_discord(event_type: str, payload: Dict[str, Any]):
-    title, desc, url, type_name, proj_id, de_id, parent_name, archived = extract_fields(payload)
+    f = extract_fields(payload)
     actor = extract_actor(payload)
 
-    # Si es borrado o archivado, no enlazamos (suele 404)
-    _, action = split_event(event_type)
-    if action == "deleted" or archived:
+    kind_l, action = split_event(event_type)
+
+    # Si es borrado o archivado (en diseño), evitamos link
+    url = f["url"]
+    if action == "deleted" or f["archived"]:
         url = None
 
-    embed = {
-        "title": title or ("Elemento de diseño" if NOTIF_LOCALE == "es" else "Design element"),
-        "description": shorten(desc, 1000),
-        "url": url,
-        "fields": [
-            {"name": "Tipo", "value": (type_name or "—"), "inline": True},
-            {"name": "ProjectId", "value": str(proj_id or "—"), "inline": True},
-            {"name": "DesignElementId", "value": str(de_id or "—"), "inline": True},
-        ],
-    }
-    if parent_name:
-        embed["fields"].append({"name": "Parent", "value": parent_name, "inline": True})
-    if actor:
-        embed["fields"].append({"name": "Responsable" if NOTIF_LOCALE=="es" else "Actor",
-                                "value": actor, "inline": True})
+    # Contenido principal humanizado
+    content = format_content(event_type, f["type_name"], f["title"], actor)
 
-    content = format_content(event_type, type_name, title, actor)
+    # Si es WorkItem y tenemos Stage -> agregar al contenido: e.g. "🧪 **Testeandose** 🧪"
+    if kind_l == "workitem" and f["stage_label"] and f["stage_emoji"]:
+        content = f"{content} — {f['stage_emoji']} **{f['stage_label']}** {f['stage_emoji']}"
+
+    # Armar embed
+    embed_title = f["title"] or ("Elemento de diseño" if NOTIF_LOCALE == "es" else "Design element")
+    embed = {
+        "title": embed_title,
+        "description": shorten(f["desc"], 1000),
+        "url": url,
+        "fields": []
+    }
+
+    # Campos comunes
+    if f["type_name"]:
+        embed["fields"].append({"name": "Tipo", "value": f["type_name"], "inline": True})
+    if f["project_id"] is not None:
+        embed["fields"].append({"name": "ProjectId", "value": str(f["project_id"]), "inline": True})
+
+    # ID según tipo
+    if kind_l == "designelement" and f["design_element_id"] is not None:
+        embed["fields"].append({"name": "DesignElementId", "value": str(f["design_element_id"]), "inline": True})
+    if kind_l == "workitem" and f["work_item_id"] is not None:
+        embed["fields"].append({"name": "WorkItemId", "value": str(f["work_item_id"]), "inline": True})
+
+    # Parent si es DesignElement
+    if f["parent_name"]:
+        embed["fields"].append({"name": "Parent", "value": f["parent_name"], "inline": True})
+
+    # Stage si es WorkItem
+    if kind_l == "workitem" and f["stage_label"]:
+        embed["fields"].append({
+            "name": "Stage",
+            "value": f"{f['stage_emoji']} {f['stage_label']} ({f['stage_id']})",
+            "inline": True
+        })
+
+    if actor:
+        embed["fields"].append({"name": "Responsable" if NOTIF_LOCALE == "es" else "Actor",
+                                "value": actor, "inline": True})
 
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(DISCORD_WEBHOOK_URL, json={"content": content, "embeds": [embed]})
@@ -219,15 +292,15 @@ async def hacknplan(req: Request, bg: BackgroundTasks):
     if TOKEN and req.query_params.get("token") != TOKEN:
         return Response("unauthorized", status_code=401)
 
-    # El tipo de evento viene en el header (oficial) o en el body (fallback)
+    # Tipo de evento (header oficial o fallback)
     event_type = req.headers.get("x-hacknplan-event")
     payload = await parse_request(req)
     if not event_type:
-        event_type = payload.get("Event") or payload.get("Type") or "DesignElement.Updated"
+        # Fallback minimal: deducimos por presencia de claves
+        event_type = "WorkItem.Updated" if "WorkItemId" in payload else "DesignElement.Updated"
 
     # Log mínimo
-    actor = extract_actor(payload)
-    print("HNP event:", event_type, "| actor:", actor)
+    print("HNP event:", event_type, "| keys:", list(payload.keys())[:12])
 
     if DISCORD_WEBHOOK_URL:
         bg.add_task(post_to_discord, event_type, payload)
