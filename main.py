@@ -1,7 +1,7 @@
 import os
 import json
 import textwrap
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 from fastapi import FastAPI, Request, Response, BackgroundTasks
 import httpx
@@ -34,15 +34,20 @@ def normalize_action(action_raw: str) -> str:
     return a or ""
 
 def split_and_normalize_event(event_type: str) -> Tuple[str, str]:
-    """Devuelve (kind_lower, action_canonical) a partir de 'DesignElement.Deleted', 'WorkItem.Removed', etc."""
+    """
+    Devuelve (kind_lower, action_canonical) a partir de variantes como:
+    'DesignElement.Deleted', 'WorkItem_Removed', 'DesignElement-Updated', etc.
+    """
     et = (event_type or "").strip()
-    if "." in et:
-        kind, action = et.split(".", 1)
+    sep = "." if "." in et else "_" if "_" in et else "-" if "-" in et else None
+    if sep:
+        kind, action = et.split(sep, 1)
     else:
         kind, action = et, ""
     return (kind.lower(), normalize_action(action))
 
-def format_event(event_type: str, type_name: str | None, locale: str = "es", element_name: str | None = None) -> str:
+def format_event(event_type: str, type_name: Optional[str], locale: str = "es",
+                 element_name: Optional[str] = None, actor: Optional[str] = None) -> str:
     kind_l, action_norm = split_and_normalize_event(event_type)
     noun_map = NOUN_MAP_ES if locale == "es" else NOUN_MAP_EN
     base_noun = noun_map.get(kind_l, ("Evento" if locale == "es" else "Event"))
@@ -70,9 +75,11 @@ def format_event(event_type: str, type_name: str | None, locale: str = "es", ele
 
     if element_name:
         label = f"{label}: {element_name}"
+    if actor:
+        # Ej: "… — por Juan Pérez"
+        label = f"{label} — por {actor}"
 
     return f"{emoji} **{label}**"
-
 
 # ====== Helpers ======
 def get_in(d: Dict[str, Any], path: List[str]):
@@ -102,8 +109,75 @@ def compute_url(payload: dict):
         # Permite usar {ProjectId}, {DesignElementId}, etc. directamente
         return HNP_URL_TEMPLATE.format(**payload)
     except Exception:
-        # Si faltan claves, no rompemos
         return None
+
+def is_deleted_like(req: Request, payload: dict, action_hint: Optional[str]) -> bool:
+    """
+    Heurística para detectar borrados cuando no viene claro en el header:
+    - método DELETE
+    - flags comunes en body (IsDeleted / Deleted / Action='removed' etc.)
+    """
+    if req.method.upper() == "DELETE":
+        return True
+    flags = [
+        str(payload.get("IsDeleted", "")).lower(),
+        str(payload.get("Deleted", "")).lower(),
+        str(payload.get("Archived", "")).lower(),
+    ]
+    if any(v in ("true", "1", "yes") for v in flags):
+        return True
+    if normalize_action(action_hint or "") == "deleted":
+        return True
+    return False
+
+def guess_kind(payload: dict) -> str:
+    if "DesignElementId" in payload:
+        return "DesignElement"
+    if "WorkItemId" in payload or "TaskId" in payload:
+        return "WorkItem"
+    return "Event"
+
+def derive_event_type(req: Request, payload: dict, header_event: Optional[str]) -> str:
+    """
+    Elige el mejor event_type posible:
+    - Usa el header si existe (X-HacknPlan-Event).
+    - Si no, arma 'DesignElement.Deleted/Updated/Created' según heurística.
+    """
+    if header_event:
+        return header_event
+
+    # Pistas dentro del body
+    action_hint = pick(payload.get("Action"), payload.get("Event"), payload.get("Type"))
+    kind = guess_kind(payload)
+
+    if is_deleted_like(req, payload, action_hint):
+        return f"{kind}.Deleted"
+
+    # Si trae CreationDate pero no UpdateDate, asumimos creado (heurística suave)
+    if payload.get("CreationDate") and not payload.get("PreviousValue"):
+        # no muy fuerte; preferimos 'Updated' si no estamos seguros
+        return f"{kind}.Created"
+
+    return f"{kind}.Updated"
+
+def extract_actor(payload: dict) -> Optional[str]:
+    """
+    Encuentra responsable del cambio en varias rutas posibles.
+    """
+    return pick(
+        get_in(payload, ["User", "Name"]),
+        get_in(payload, ["User", "FullName"]),
+        get_in(payload, ["User", "Username"]),
+        get_in(payload, ["UpdatedBy", "Name"]),
+        get_in(payload, ["UpdatedBy", "FullName"]),
+        get_in(payload, ["ChangedBy", "Name"]),
+        get_in(payload, ["ChangedBy", "FullName"]),
+        payload.get("UserName"),
+        payload.get("Username"),
+        payload.get("UpdatedBy"),
+        payload.get("ChangedBy"),
+        payload.get("Author"),
+    )
 
 def extract_fields(payload: dict):
     """
@@ -148,9 +222,10 @@ def extract_fields(payload: dict):
 
     return title, desc, url, type_name, design_element_id, project_id, parent_name
 
-
-async def post_to_discord(event_type: str, payload: Dict[str, Any], raw_excerpt: str):
+# ====== Discord ======
+async def post_to_discord(event_type: str, payload: Dict[str, Any], raw_excerpt: str, req_method: str):
     title, desc, url, type_name, de_id, proj_id, parent_name = extract_fields(payload)
+    actor = extract_actor(payload)
 
     # Fallback de descripción
     if not (isinstance(desc, str) and desc.strip()):
@@ -174,8 +249,11 @@ async def post_to_discord(event_type: str, payload: Dict[str, Any], raw_excerpt:
 
     if parent_name:
         embed["fields"].append({"name": "Parent", "value": parent_name, "inline": True})
+    if actor:
+        embed["fields"].append({"name": "Responsable", "value": actor, "inline": True})
+    embed["fields"].append({"name": "HTTP", "value": req_method, "inline": True})  # ayuda a debug
 
-    content = format_event(event_type, type_name, NOTIF_LOCALE, element_name=title)
+    content = format_event(event_type, type_name, NOTIF_LOCALE, element_name=title, actor=actor)
 
     body = {"content": content, "embeds": [embed]}
 
@@ -183,7 +261,7 @@ async def post_to_discord(event_type: str, payload: Dict[str, Any], raw_excerpt:
         r = await client.post(DISCORD_WEBHOOK_URL, json=body)
         r.raise_for_status()
 
-
+# ====== Parsing de requests ======
 async def parse_request(req: Request) -> Dict[str, Any]:
     """
     Soporta:
@@ -219,7 +297,6 @@ async def parse_request(req: Request) -> Dict[str, Any]:
 
     return {}
 
-
 # ====== Endpoints ======
 @app.api_route("/hacknplan", methods=["POST", "DELETE"])
 async def hacknplan(req: Request, bg: BackgroundTasks):
@@ -227,31 +304,27 @@ async def hacknplan(req: Request, bg: BackgroundTasks):
     if TOKEN and req.query_params.get("token") != TOKEN:
         return Response("unauthorized", status_code=401)
 
-    # Tipo de evento por header o por cuerpo
-    event_type = req.headers.get("x-hacknplan-event")
+    # Tipo de evento
+    header_event = req.headers.get("x-hacknplan-event")
     payload = await parse_request(req)
-    event_type = event_type or payload.get("event") or payload.get("type") or "Unknown"
+    event_type = derive_event_type(req, payload, header_event)
 
-    # Resumen crudo del payload (para logs)
+    # Logs en Render (útiles para los deleted que no llegaban)
     try:
-        raw_excerpt = shorten(
-            textwrap.indent(json.dumps(payload, ensure_ascii=False, indent=2), "  "),
-            900,
-        )
+        headers_preview = {k: v for k, v in req.headers.items() if k.lower().startswith(("x-hacknplan", "content-type"))}
     except Exception:
-        raw_excerpt = "—"
-
-    # Logs en Render
+        headers_preview = {}
     print("HNP method:", req.method)
-    print("HNP event:", event_type)
+    print("HNP event:", event_type, "| headers:", headers_preview)
     print("Payload keys:", list(payload.keys())[:20])
 
     # Responder rápido y enviar a Discord en background para evitar timeouts
     if DISCORD_WEBHOOK_URL:
-        bg.add_task(post_to_discord, event_type, payload, raw_excerpt)
+        bg.add_task(post_to_discord, event_type, payload, 
+                    shorten(textwrap.indent(json.dumps(payload, ensure_ascii=False, indent=2), "  "), 900),
+                    req.method)
 
     return Response("OK", status_code=200)
-
 
 @app.get("/healthz")
 def healthz():
