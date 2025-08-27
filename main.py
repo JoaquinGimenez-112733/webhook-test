@@ -8,7 +8,8 @@ import httpx
 # ================== Config ==================
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")      # Webhook del canal en Discord
 TOKEN = os.environ.get("TOKEN")                                   # ?token=...
-HNP_URL_TEMPLATE = os.environ.get("HNP_URL_TEMPLATE")             # ej: https://app.hacknplan.com/p/{ProjectId}/gamemodel?nodeId={DesignElementId}&nodeTabId=basicinfo
+HNP_URL_TEMPLATE = os.environ.get("HNP_URL_TEMPLATE")             # DesignModel: https://app.hacknplan.com/p/{ProjectId}/gamemodel?nodeId={DesignElementId}&nodeTabId=basicinfo
+HNP_BOARD_URL_TEMPLATE = os.environ.get("HNP_BOARD_URL_TEMPLATE") # Boards:     https://app.hacknplan.com/p/{ProjectId}/kanban?categoryId={CategoryId}&boardId={BoardId}
 NOTIF_LOCALE = os.environ.get("NOTIF_LOCALE", "es")               # "es" | "en"
 
 app = FastAPI(title="HacknPlan → Discord bridge")
@@ -99,7 +100,7 @@ def shorten(s: str, n: int = 900):
     s = s.strip()
     return s if len(s) <= n else (s[:n] + "…")
 
-def compute_url(payload: dict) -> Optional[str]:
+def compute_design_url(payload: dict) -> Optional[str]:
     if not HNP_URL_TEMPLATE:
         return None
     try:
@@ -107,9 +108,22 @@ def compute_url(payload: dict) -> Optional[str]:
     except Exception:
         return None
 
+def compute_board_url(payload: dict) -> Optional[str]:
+    if not HNP_BOARD_URL_TEMPLATE:
+        return None
+    try:
+        ctx = {
+            "ProjectId": payload.get("ProjectId"),
+            "BoardId": get_in(payload, ["Board", "BoardId"]) or payload.get("BoardId"),
+            "CategoryId": get_in(payload, ["Category", "CategoryId"]) or payload.get("CategoryId") or 0,
+        }
+        return HNP_BOARD_URL_TEMPLATE.format(**ctx)
+    except Exception:
+        return None
+
 # ================== Extractores ==================
-# Actor: ajustado a DesignElement y WorkItem (tu payload real incluye User.User.* en Design; en WorkItem puede venir User.Name vacío, así que probamos AssignedUsers[0])
 ACTOR_PATHS: List[List[Union[str, int]]] = [
+    # DesignElement payloads
     ["User", "User", "Name"],
     ["User", "User", "Username"],
     ["User", "Name"],
@@ -117,6 +131,7 @@ ACTOR_PATHS: List[List[Union[str, int]]] = [
     ["UpdatedBy", "Name"],
     ["ChangedBy", "Name"],
     ["Author", "Name"],
+    # WorkItem payloads
     ["AssignedUsers", 0, "User", "Name"],
     ["AssignedUsers", 0, "User", "Username"],
 ]
@@ -129,9 +144,6 @@ def extract_actor(p: dict) -> Optional[str]:
     return None
 
 def extract_stage_info(p: dict) -> Tuple[Optional[int], Optional[str], Optional[str]]:
-    """
-    Devuelve (stage_id, stage_label, stage_emoji) para WorkItem.
-    """
     sid = get_in(p, ["Stage", "StageId"])
     if isinstance(sid, int) and sid in WORK_STAGE_MAP:
         label, emoji = WORK_STAGE_MAP[sid]
@@ -140,7 +152,6 @@ def extract_stage_info(p: dict) -> Tuple[Optional[int], Optional[str], Optional[
 
 def extract_fields(p: dict):
     """Campos comunes y específicos (DesignElement/WorkItem)."""
-    # título
     title = pick_str(
         get_in(p, ["data", "title"]),
         get_in(p, ["data", "name"]),
@@ -148,7 +159,6 @@ def extract_fields(p: dict):
         p.get("title"), p.get("name"),
     )
 
-    # descripción
     desc = pick_str(
         get_in(p, ["data", "summary"]),
         get_in(p, ["data", "description"]),
@@ -156,32 +166,28 @@ def extract_fields(p: dict):
         p.get("description"), p.get("summary"),
     ) or ("Sin descripción." if NOTIF_LOCALE == "es" else "No description.")
 
-    # tipo (solo DesignElement suele traer Type.Name)
     type_name = pick_str(
         get_in(p, ["Type", "Name"]),
         get_in(p, ["data", "type", "name"]),
         p.get("TypeName"),
     )
 
-    # ids
     project_id = p.get("ProjectId") or get_in(p, ["data", "projectId"])
     design_element_id = p.get("DesignElementId") or get_in(p, ["data", "id"])
     work_item_id = p.get("WorkItemId")
 
-    # url (solo aplicará a DesignElement si tienes HNP_URL_TEMPLATE configurada a ese recurso)
-    url = pick_str(
+    # URLs
+    design_url = pick_str(
         get_in(p, ["data", "url"]),
         get_in(p, ["data", "webUrl"]),
         p.get("Url"), p.get("url"),
-    ) or compute_url(p)
+    ) or compute_design_url(p)
 
-    # parent para design elements
+    board_url = compute_board_url(p)
+
     parent_name = get_in(p, ["Parent", "Name"])
-
-    # stage para work items
     stage_id, stage_label, stage_emoji = extract_stage_info(p)
 
-    # archivado (para tratar como delete lógico)
     archived = str(p.get("Archived", "")).lower() in ("true", "1", "yes") or \
                str(p.get("IsArchived", "")).lower() in ("true", "1", "yes")
 
@@ -192,7 +198,8 @@ def extract_fields(p: dict):
         "project_id": project_id,
         "design_element_id": design_element_id,
         "work_item_id": work_item_id,
-        "url": url,
+        "design_url": design_url,
+        "board_url": board_url,
         "parent_name": parent_name,
         "stage_id": stage_id,
         "stage_label": stage_label,
@@ -207,10 +214,14 @@ async def post_to_discord(event_type: str, payload: Dict[str, Any]):
 
     kind_l, action = split_event(event_type)
 
-    # Si es borrado o archivado (en diseño), evitamos link
-    url = f["url"]
-    if action == "deleted" or f["archived"]:
-        url = None
+    # URL del embed:
+    # - DesignElement: usar design_url (salvo deleted/archived → None)
+    # - WorkItem: usar board_url (la board existe aunque se cambie/elimine la tarea)
+    url = None
+    if kind_l == "designelement":
+        url = None if action == "deleted" or f["archived"] else f["design_url"]
+    elif kind_l == "workitem":
+        url = f["board_url"]  # siempre que haya board info
 
     # Contenido principal humanizado
     content = format_content(event_type, f["type_name"], f["title"], actor)
@@ -234,15 +245,19 @@ async def post_to_discord(event_type: str, payload: Dict[str, Any]):
     if f["project_id"] is not None:
         embed["fields"].append({"name": "ProjectId", "value": str(f["project_id"]), "inline": True})
 
-    # ID según tipo
+    # IDs y específicos
     if kind_l == "designelement" and f["design_element_id"] is not None:
         embed["fields"].append({"name": "DesignElementId", "value": str(f["design_element_id"]), "inline": True})
-    if kind_l == "workitem" and f["work_item_id"] is not None:
-        embed["fields"].append({"name": "WorkItemId", "value": str(f["work_item_id"]), "inline": True})
-
-    # Parent si es DesignElement
-    if f["parent_name"]:
-        embed["fields"].append({"name": "Parent", "value": f["parent_name"], "inline": True})
+    if kind_l == "workitem":
+        if f["work_item_id"] is not None:
+            embed["fields"].append({"name": "WorkItemId", "value": str(f["work_item_id"]), "inline": True})
+        # Mostrar Board info (ID y link visible en descripción/URL del embed)
+        board_id = get_in(payload, ["Board", "BoardId"]) or payload.get("BoardId")
+        cat_id = get_in(payload, ["Category", "CategoryId"]) or payload.get("CategoryId")
+        if board_id is not None:
+            embed["fields"].append({"name": "BoardId", "value": str(board_id), "inline": True})
+        if cat_id is not None:
+            embed["fields"].append({"name": "CategoryId", "value": str(cat_id), "inline": True})
 
     # Stage si es WorkItem
     if kind_l == "workitem" and f["stage_label"]:
@@ -296,7 +311,6 @@ async def hacknplan(req: Request, bg: BackgroundTasks):
     event_type = req.headers.get("x-hacknplan-event")
     payload = await parse_request(req)
     if not event_type:
-        # Fallback minimal: deducimos por presencia de claves
         event_type = "WorkItem.Updated" if "WorkItemId" in payload else "DesignElement.Updated"
 
     # Log mínimo
