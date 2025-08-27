@@ -9,10 +9,60 @@ import httpx
 # ====== Config vía variables de entorno ======
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")  # Webhook de tu canal de Discord
 TOKEN = os.environ.get("TOKEN")  # opcional: auth por query param ?token=...
-HNP_URL_TEMPLATE = os.environ.get("HNP_URL_TEMPLATE")  # opcional: plantilla para linkear el elemento
-
+HNP_URL_TEMPLATE = os.environ.get("HNP_URL_TEMPLATE")  # ej: https://app.hacknplan.com/p/{ProjectId}/gamemodel?nodeId={DesignElementId}&nodeTabId=basicinfo
+NOTIF_LOCALE = os.environ.get("NOTIF_LOCALE", "es")  # "es" o "en"
 
 app = FastAPI(title="HacknPlan → Discord bridge")
+
+# ====== Diccionarios para humanizar el evento ======
+EMOJI = {"created": "➕", "updated": "✏️", "deleted": "🗑️"}
+NOUN_MAP_ES = {
+    "designelement": "Elemento de diseño",
+    "workitem": "Tarea",
+}
+NOUN_MAP_EN = {
+    "designelement": "Design element",
+    "workitem": "Work item",
+}
+
+def format_event(event_type: str, type_name: str | None, locale: str = "es", element_name: str | None = None) -> str:
+    et = (event_type or "").strip()
+    if "." in et:
+        kind, action = et.split(".", 1)
+    else:
+        kind, action = et, ""
+    kind_l = kind.lower()
+    action_l = action.lower()
+
+    noun_map = NOUN_MAP_ES if locale == "es" else NOUN_MAP_EN
+    base_noun = noun_map.get(kind_l, ("Evento" if locale == "es" else "Event"))
+    noun = type_name or base_noun
+
+    emoji = EMOJI.get(action_l, "🔔")
+
+    if locale == "es":
+        if action_l == "created":
+            label = f"Nuevo {noun}"
+        elif action_l == "deleted":
+            label = f"{noun} eliminado"
+        elif action_l == "updated":
+            label = f"{noun} actualizado"
+        else:
+            label = f"{noun} ({et or 'Evento'})"
+    else:
+        if action_l == "created":
+            label = f"New {noun}"
+        elif action_l == "deleted":
+            label = f"{noun} deleted"
+        elif action_l == "updated":
+            label = f"{noun} updated"
+        else:
+            label = f"{noun} ({et or 'Event'})"
+
+    if element_name:
+        label = f"{label}: {element_name}"
+
+    return f"{emoji} **{label}**"
 
 
 # ====== Helpers ======
@@ -25,18 +75,15 @@ def get_in(d: Dict[str, Any], path: List[str]):
             return None
     return cur
 
-
 def pick(*vals):
     for v in vals:
         if isinstance(v, str) and v.strip():
             return v.strip()
     return None
 
-
 def shorten(s: str, n: int = 900):
     s = s.strip()
     return s if len(s) <= n else (s[:n] + "…")
-
 
 def compute_url(payload: dict):
     """Construye una URL a partir de HNP_URL_TEMPLATE y el payload si está configurada."""
@@ -49,11 +96,10 @@ def compute_url(payload: dict):
         # Si faltan claves, no rompemos
         return None
 
-
 def extract_fields(payload: dict):
     """
     Extrae campos de título, descripción, url y metadatos,
-    cubriendo tanto esquemas 'data.*' como PascalCase de HacknPlan.
+    cubriendo tanto esquemas 'data.*' como el PascalCase de HacknPlan.
     """
     title = (
         get_in(payload, ["data", "title"])
@@ -67,7 +113,7 @@ def extract_fields(payload: dict):
     desc = (
         get_in(payload, ["data", "summary"])
         or get_in(payload, ["data", "description"])
-        or payload.get("Description")
+        or payload.get("Description")  # <- en tu payload venía vacío
         or payload.get("Summary")
         or payload.get("description")
         or payload.get("summary")
@@ -89,19 +135,21 @@ def extract_fields(payload: dict):
 
     design_element_id = payload.get("DesignElementId") or get_in(payload, ["data", "id"])
     project_id = payload.get("ProjectId") or get_in(payload, ["data", "projectId"])
+    parent_name = get_in(payload, ["Parent", "Name"])  # puede venir null
 
-    return title, desc, url, type_name, design_element_id, project_id
+    return title, desc, url, type_name, design_element_id, project_id, parent_name
 
 
 async def post_to_discord(event_type: str, payload: Dict[str, Any], raw_excerpt: str):
-    title, desc, url, type_name, de_id, proj_id = extract_fields(payload)
+    title, desc, url, type_name, de_id, proj_id, parent_name = extract_fields(payload)
 
-    if not title and not desc:
-        desc = f"Raw payload excerpt:\n{raw_excerpt}"
+    # Fallback si la descripción viene vacía
+    if not (isinstance(desc, str) and desc.strip()):
+        desc = "Sin descripción."
 
     embed = {
         "title": title or "Elemento de diseño",
-        "description": shorten((desc or "—"), 1000),
+        "description": shorten(desc, 1000),
         "url": url,
         "fields": [
             {"name": "Tipo", "value": (type_name or "—"), "inline": True},
@@ -110,8 +158,13 @@ async def post_to_discord(event_type: str, payload: Dict[str, Any], raw_excerpt:
         ],
     }
 
+    if parent_name:
+        embed["fields"].append({"name": "Parent", "value": parent_name, "inline": True})
+
+    content = format_event(event_type, type_name, NOTIF_LOCALE, element_name=title)
+
     body = {
-        "content": f"🔔 **{event_type or 'Event'}**",
+        "content": content,
         "embeds": [embed],
     }
 
@@ -168,7 +221,7 @@ async def hacknplan(req: Request, bg: BackgroundTasks):
     payload = await parse_request(req)
     event_type = event_type or payload.get("event") or payload.get("type") or "Unknown"
 
-    # Resumen crudo del payload para depurar (se usa solo si no hay campos mapeados)
+    # Resumen crudo del payload (solo por si querés debug; ya no lo mostramos en Discord)
     try:
         raw_excerpt = shorten(
             textwrap.indent(json.dumps(payload, ensure_ascii=False, indent=2), "  "),
