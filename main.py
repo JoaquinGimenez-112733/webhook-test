@@ -1,60 +1,50 @@
 import os, json
-from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi import FastAPI, Request, Response, BackgroundTasks
 import httpx
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
-INTERNAL_TOKEN = os.environ.get("INTERNAL_TOKEN")  # opcional
+TOKEN = os.environ.get("TOKEN")  # secreto opcional via ?token=...
 
-app = FastAPI(title="HNP → Discord bridge")
-
-def want_event(event_type: str) -> bool:
-    # filtrá acá lo que te interesa; ej: solo Design Model
-    return event_type.startswith("DesignElement")  # Created/Updated/Deleted
+app = FastAPI(title="HNP → Discord bridge (compat)")
 
 async def send_to_discord(event_type: str, payload: dict):
-    title = payload.get("data", {}).get("title") or payload.get("title") or "Design element"
-    url = payload.get("data", {}).get("url") or payload.get("url")
-    desc = payload.get("data", {}).get("summary") or payload.get("summary") or ""
-    if desc and len(desc) > 400:
+    title = (payload.get("data", {}) or {}).get("title") or payload.get("title") or "Design element"
+    url = (payload.get("data", {}) or {}).get("url") or payload.get("url")
+    desc = (payload.get("data", {}) or {}).get("summary") or payload.get("summary") or ""
+    if isinstance(desc, str) and len(desc) > 400:
         desc = desc[:400] + "…"
 
     discord_payload = {
-        "content": f"🔔 **{event_type}**",
-        "embeds": [{
-            "title": title,
-            "description": desc or "—",
-            "url": url,
-        }]
+        "content": f"🔔 **{event_type or 'Event'}**",
+        "embeds": [{"title": title, "description": desc or "—", "url": url}]
     }
     async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.post(DISCORD_WEBHOOK_URL, json=discord_payload)
-        r.raise_for_status()
+        await client.post(DISCORD_WEBHOOK_URL, json=discord_payload)
 
 @app.post("/hacknplan")
-async def hacknplan(req: Request):
-    # Validación opcional por token propio
-    if INTERNAL_TOKEN:
-        if req.headers.get("x-internal-token") != INTERNAL_TOKEN:
-            raise HTTPException(status_code=401, detail="bad token")
+async def hacknplan(req: Request, bg: BackgroundTasks):
+    # Auth por querystring: /hacknplan?token=XXXXX
+    if TOKEN:
+        if req.query_params.get("token") != TOKEN:
+            return Response("unauthorized", status_code=401)
 
+    # Headers y body (tolerante a cualquier content-type)
     event_type = req.headers.get("x-hacknplan-event", "Unknown")
+    body_bytes = await req.body()
     try:
-        payload = await req.json()
+        payload = json.loads(body_bytes) if body_bytes else {}
     except Exception:
-        payload = {}
+        payload = {"raw": body_bytes.decode("utf-8", "ignore")}
 
-    # Filtrado de eventos
-    if not want_event(event_type):
-        return Response(content="ignored", status_code=200)
+    # Log mínimo en Render (Settings → Logs)
+    print("HNP event:", event_type, "| payload keys:", list(payload.keys()))
 
-    # Reenvío a Discord (sin romper el webhook si falla)
-    try:
-        await send_to_discord(event_type, payload)
-    except Exception as e:
-        # devolvemos 200 para que HacknPlan no reintente en loop; logueá en Render
-        print("Discord error:", e)
+    # Enviar a Discord en background (NO bloquea la respuesta a HNP)
+    if DISCORD_WEBHOOK_URL:
+        bg.add_task(send_to_discord, event_type, payload)
 
-    return Response(content="OK", status_code=200)
+    # Responder rápido 200 para evitar reintentos de HNP
+    return Response("OK", status_code=200)
 
 @app.get("/healthz")
 def healthz():
