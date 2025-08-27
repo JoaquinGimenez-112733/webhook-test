@@ -1,13 +1,21 @@
-import os, json, textwrap
+import os
+import json
+import textwrap
 from typing import Any, Dict, List
+
 from fastapi import FastAPI, Request, Response, BackgroundTasks
 import httpx
 
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
-TOKEN = os.environ.get("TOKEN")  # opcional: /hacknplan?token=...
+# ====== Config vía variables de entorno ======
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")  # Webhook de tu canal de Discord
+TOKEN = os.environ.get("TOKEN")  # opcional: auth por query param ?token=...
+HNP_URL_TEMPLATE = os.environ.get("HNP_URL_TEMPLATE")  # opcional: plantilla para linkear el elemento
 
-app = FastAPI(title="HNP → Discord bridge (robusto)")
 
+app = FastAPI(title="HacknPlan → Discord bridge")
+
+
+# ====== Helpers ======
 def get_in(d: Dict[str, Any], path: List[str]):
     cur = d
     for k in path:
@@ -17,103 +25,127 @@ def get_in(d: Dict[str, Any], path: List[str]):
             return None
     return cur
 
+
 def pick(*vals):
     for v in vals:
         if isinstance(v, str) and v.strip():
             return v.strip()
     return None
 
+
 def shorten(s: str, n: int = 900):
     s = s.strip()
     return s if len(s) <= n else (s[:n] + "…")
 
-def extract_fields(payload: Dict[str, Any]):
+
+def compute_url(payload: dict):
+    """Construye una URL a partir de HNP_URL_TEMPLATE y el payload si está configurada."""
+    if not HNP_URL_TEMPLATE:
+        return None
+    try:
+        # Permite usar {ProjectId}, {DesignElementId}, etc. directamente
+        return HNP_URL_TEMPLATE.format(**payload)
+    except Exception:
+        # Si faltan claves, no rompemos
+        return None
+
+
+def extract_fields(payload: dict):
     """
-    Intentamos cubrir distintos esquemas (DesignElement/WorkItem/otros).
+    Extrae campos de título, descripción, url y metadatos,
+    cubriendo tanto esquemas 'data.*' como PascalCase de HacknPlan.
     """
-
-    # Posibles títulos
-    title = pick(
-        get_in(payload, ["data", "title"]),
-        get_in(payload, ["data", "name"]),
-        get_in(payload, ["designElement", "title"]),
-        get_in(payload, ["element", "title"]),
-        get_in(payload, ["workItem", "title"]),
-        payload.get("title"),
-        payload.get("name"),
+    title = (
+        get_in(payload, ["data", "title"])
+        or get_in(payload, ["data", "name"])
+        or payload.get("Name")
+        or payload.get("Title")
+        or payload.get("name")
+        or payload.get("title")
     )
 
-    # Posibles descripciones/resúmenes
-    desc = pick(
-        get_in(payload, ["data", "summary"]),
-        get_in(payload, ["data", "description"]),
-        get_in(payload, ["data", "contentPlain"]),
-        get_in(payload, ["designElement", "summary"]),
-        get_in(payload, ["element", "summary"]),
-        payload.get("summary"),
-        payload.get("description"),
+    desc = (
+        get_in(payload, ["data", "summary"])
+        or get_in(payload, ["data", "description"])
+        or payload.get("Description")
+        or payload.get("Summary")
+        or payload.get("description")
+        or payload.get("summary")
     )
 
-    # Posibles URLs
-    url = pick(
-        get_in(payload, ["data", "url"]),
-        get_in(payload, ["data", "webUrl"]),
-        get_in(payload, ["links", "html"]),
-        payload.get("url"),
+    url = (
+        get_in(payload, ["data", "url"])
+        or get_in(payload, ["data", "webUrl"])
+        or payload.get("Url")
+        or payload.get("url")
+        or compute_url(payload)
     )
 
-    return title, desc, url
+    type_name = (
+        get_in(payload, ["Type", "Name"])
+        or get_in(payload, ["data", "type", "name"])
+        or payload.get("TypeName")
+    )
+
+    design_element_id = payload.get("DesignElementId") or get_in(payload, ["data", "id"])
+    project_id = payload.get("ProjectId") or get_in(payload, ["data", "projectId"])
+
+    return title, desc, url, type_name, design_element_id, project_id
+
 
 async def post_to_discord(event_type: str, payload: Dict[str, Any], raw_excerpt: str):
-    title, desc, url = extract_fields(payload)
+    title, desc, url, type_name, de_id, proj_id = extract_fields(payload)
 
-    # Si no encontramos campos, mostramos un recorte del payload para depurar
     if not title and not desc:
-        if not desc:
-            desc = f"Raw payload excerpt:\n{raw_excerpt}"
+        desc = f"Raw payload excerpt:\n{raw_excerpt}"
 
     embed = {
-        "title": title or "Evento de diseño",
-        "description": shorten(desc or "—", 1000),
-        "url": url
+        "title": title or "Elemento de diseño",
+        "description": shorten((desc or "—"), 1000),
+        "url": url,
+        "fields": [
+            {"name": "Tipo", "value": (type_name or "—"), "inline": True},
+            {"name": "DesignElementId", "value": str(de_id or "—"), "inline": True},
+            {"name": "ProjectId", "value": str(proj_id or "—"), "inline": True},
+        ],
     }
 
     body = {
         "content": f"🔔 **{event_type or 'Event'}**",
-        "embeds": [embed]
+        "embeds": [embed],
     }
 
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(DISCORD_WEBHOOK_URL, json=body)
         r.raise_for_status()
 
+
 async def parse_request(req: Request) -> Dict[str, Any]:
     """
-    Soporta application/json y application/x-www-form-urlencoded con 'payload' como JSON string.
+    Soporta:
+      - application/json (payload JSON directo)
+      - application/x-www-form-urlencoded o multipart/form-data con 'payload' (string JSON)
+      - fallback: cuerpo crudo en 'raw'
     """
     ctype = (req.headers.get("content-type") or "").lower()
     if "application/json" in ctype:
-        # JSON directo
         try:
             return await req.json()
         except Exception:
-            pass  # caemos a lectura cruda más abajo
+            pass
 
     if "application/x-www-form-urlencoded" in ctype or "multipart/form-data" in ctype:
         try:
             form = await req.form()
-            # Algunos servicios mandan 'payload' (string JSON) o campos sueltos
             if "payload" in form:
                 try:
-                    return json.loads(form["payload"])  # string → dict
+                    return json.loads(form["payload"])
                 except Exception:
                     return {"payload": str(form["payload"])}
-            # Si no hay 'payload', devolvemos todo el form como dict
             return {k: form[k] for k in form.keys()}
         except Exception:
             pass
 
-    # Fallback: leer bytes y tratar de parsear JSON; si no, guardar crudo
     raw = await req.body()
     if raw:
         try:
@@ -123,9 +155,11 @@ async def parse_request(req: Request) -> Dict[str, Any]:
 
     return {}
 
+
+# ====== Endpoints ======
 @app.post("/hacknplan")
 async def hacknplan(req: Request, bg: BackgroundTasks):
-    # Auth por query param
+    # Auth simple por query param: /hacknplan?token=XXXXX
     if TOKEN and req.query_params.get("token") != TOKEN:
         return Response("unauthorized", status_code=401)
 
@@ -134,21 +168,25 @@ async def hacknplan(req: Request, bg: BackgroundTasks):
     payload = await parse_request(req)
     event_type = event_type or payload.get("event") or payload.get("type") or "Unknown"
 
-    # Resumen del payload crudo para depuración en Discord si falta mapeo
+    # Resumen crudo del payload para depurar (se usa solo si no hay campos mapeados)
     try:
-        raw_excerpt = shorten(textwrap.indent(json.dumps(payload, ensure_ascii=False, indent=2), "  "), 900)
+        raw_excerpt = shorten(
+            textwrap.indent(json.dumps(payload, ensure_ascii=False, indent=2), "  "),
+            900,
+        )
     except Exception:
         raw_excerpt = "—"
 
-    # Log en Render
+    # Logs en Render (Panel → Logs)
     print("HNP event:", event_type)
     print("Payload keys:", list(payload.keys())[:20])
 
-    # Responder rápido a HNP y enviar a Discord en background
+    # Responder rápido y enviar a Discord en background para evitar timeouts
     if DISCORD_WEBHOOK_URL:
         bg.add_task(post_to_discord, event_type, payload, raw_excerpt)
 
     return Response("OK", status_code=200)
+
 
 @app.get("/healthz")
 def healthz():
